@@ -1,0 +1,130 @@
+{
+  "name": "containers-project-tree",
+  "displayName": "Containers Project Tree",
+  "description": "Manage fully isolated dev containers per project from a sidebar tree. Independent image and volume per container, optional in-container egress allowlist firewall, multi-template scaffolding (Debian / Alpine / RHEL). Works with WSL and Docker Desktop.",
+  "version": "0.0.109",
+  "publisher": "jkudo",
+  "icon": "media/icon.png",
+  "homepage": "https://github.com/jkudo/containers-project-tree#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jkudo/containers-project-tree.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jkudo/containers-project-tree/issues"
+  },
+  "engines": { "vscode": "^1.74.0" },
+  "extensionKind": ["ui"],
+  "extensionDependencies": ["ms-vscode-remote.remote-containers"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Containers Project Tree",
+      "properties": {
+        "cpt.projects": {
+          "type": "array",
+          "description": "List of managed projects. Each dev container's labels cpt.project=name / cpt.env=envName must match. Normally created via the extension + and appended automatically.",
+          "default": [],
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "description": "Project name (matches label cpt.project)" },
+              "engine": { "type": "string", "enum": ["wsl", "local", "win"], "description": "Project engine (fixed for all envs). wsl=WSL distro / local=local Docker Desktop (Win/Mac; win is an alias)" },
+              "shared": { "type": "boolean", "description": "Mount the project shared volume (<project>-shared) at /shared in every env" },
+              "environments": {
+                "type": "array",
+                "description": "Containers under the project",
+                "items": {
+                  "type": "object",
+                  "required": ["label", "engine"],
+                  "properties": {
+                    "label":  { "type": "string", "description": "Container display name (matches label cpt.env)" },
+                    "engine": { "type": "string", "enum": ["wsl", "local", "win"], "description": "Engine (wsl / local=local Docker Desktop / win=alias of local)" },
+                    "distro": { "type": "string", "description": "WSL distro registration name (when engine=wsl)" },
+                    "path":   { "type": "string", "description": "Anchor folder path" },
+                    "envId":  { "type": "string", "description": "(optional) cpt.env label value; defaults to label" },
+                    "memory": { "type": "string", "enum": ["on", "off"], "description": "auto-memory. off denies writes to memory (default on)" },
+                    "firewall": { "type": "string", "enum": ["on", "off"], "description": "egress firewall. New envs default to off (init-firewall not run = no egress restriction). Turn on via right-click for allowlist restriction. Omitted (legacy env) is treated as on for compatibility." },
+                    "template": { "type": "string", "description": "Template name (Dockerfile/init-firewall.sh set) used to scaffold this env. Defaults to 'default'. Managed via 'Edit templates…'." },
+                    "baseImage": { "type": "string", "description": "Docker base image — written directly into the Dockerfile's FROM line (no build-arg indirection). Omit to keep the template's default. The 'default' template uses apt and works with Debian-family images (node:N, ubuntu, debian); 'alpine' uses apk; 'rhel' uses dnf — picking a base from a different family than the template will fail to build. After changing here, right-click the container → 'Re-apply template' with the Dockerfile box checked → Rebuild." }
+                  }
+                }
+              },
+              "distro":  { "type": "string", "description": "(legacy) WSL distro registration name" },
+              "wslPath": { "type": "string", "description": "(legacy) absolute WSL anchor path" },
+              "winPath": { "type": "string", "description": "(legacy) Windows anchor" }
+            }
+          }
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "cpt", "title": "Containers Project Tree", "icon": "media/activity-bar.svg" }
+      ]
+    },
+    "views": {
+      "cpt": [
+        { "id": "cpt.envs", "name": "Projects" },
+        { "id": "cpt.volumes", "name": "Volumes", "visibility": "collapsed" }
+      ]
+    },
+    "commands": [
+      { "command": "cpt.createProject",   "title": "New project", "icon": "$(add)" },
+      { "command": "cpt.refresh",          "title": "Refresh", "icon": "$(refresh)" },
+      { "command": "cpt.editTemplates",     "title": "Manage templates (Dockerfile / firewall)…", "icon": "$(file-code)" },
+      { "command": "cpt.addEnvironment",   "title": "Add container", "icon": "$(add)" },
+      { "command": "cpt.toggleShared",     "title": "Toggle shared volume", "icon": "$(folder-library)" },
+      { "command": "cpt.open",             "title": "Open", "icon": "$(terminal)" },
+      { "command": "cpt.stop",             "title": "Stop", "icon": { "light": "media/stop.svg", "dark": "media/stop.svg" } },
+      { "command": "cpt.rebuild",          "title": "Rebuild", "icon": "$(debug-restart)" },
+      { "command": "cpt.firewallOn",       "title": "Firewall ON",     "icon": "$(shield)" },
+      { "command": "cpt.firewallOff",      "title": "Firewall OFF",    "icon": "$(shield)" },
+      { "command": "cpt.editDockerfile",   "title": "Edit Dockerfile", "icon": "$(file-code)" },
+      { "command": "cpt.editFirewall",     "title": "Edit firewall script", "icon": "$(shield)" },
+      { "command": "cpt.resyncTemplate",   "title": "Re-apply template", "icon": "$(sync)" },
+      { "command": "cpt.deleteVolume",     "title": "Delete volume", "icon": "$(trash)" },
+      { "command": "cpt.removeEnvironment","title": "Delete container", "icon": "$(trash)" },
+      { "command": "cpt.removeProject",    "title": "Delete project", "icon": "$(trash)" }
+    ],
+    "viewsWelcome": [
+      {
+        "view": "cpt.envs",
+        "contents": "No projects.\n\nA project groups isolated dev containers.\n\n[New project](command:cpt.createProject)"
+      },
+      {
+        "view": "cpt.volumes",
+        "contents": "No volumes."
+      }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "cpt.createProject", "when": "view == cpt.envs", "group": "navigation@1" },
+        { "command": "cpt.refresh",       "when": "view == cpt.envs", "group": "navigation@2" },
+        { "command": "cpt.editTemplates",  "when": "view == cpt.envs", "group": "navigation@3" },
+        { "command": "cpt.refresh",       "when": "view == cpt.volumes", "group": "navigation@1" }
+      ],
+      "view/item/context": [
+        { "command": "cpt.open",             "when": "view == cpt.envs && viewItem =~ /^env /", "group": "inline@1" },
+        { "command": "cpt.stop",             "when": "view == cpt.envs && viewItem =~ /state:running/",  "group": "inline@2" },
+        { "command": "cpt.open",             "when": "view == cpt.envs && viewItem =~ /^env /", "group": "1_run@1" },
+        { "command": "cpt.stop",             "when": "view == cpt.envs && viewItem =~ /state:running/",  "group": "1_run@2" },
+        { "command": "cpt.rebuild",          "when": "view == cpt.envs && viewItem =~ /^env /", "group": "1_run@3" },
+        { "command": "cpt.firewallOn",       "when": "view == cpt.envs && viewItem =~ /fw:off/",  "group": "2_config@2" },
+        { "command": "cpt.firewallOff",      "when": "view == cpt.envs && viewItem =~ /fw:on/",   "group": "2_config@2" },
+        { "command": "cpt.editDockerfile",   "when": "view == cpt.envs && viewItem =~ /^env /", "group": "2_config@3" },
+        { "command": "cpt.editFirewall",     "when": "view == cpt.envs && viewItem =~ /^env /", "group": "2_config@4" },
+        { "command": "cpt.resyncTemplate",   "when": "view == cpt.envs && viewItem =~ /^env /", "group": "2_config@5" },
+        { "command": "cpt.removeEnvironment","when": "view == cpt.envs && viewItem =~ /^env /", "group": "3_edit@1" },
+        { "command": "cpt.deleteVolume",     "when": "view == cpt.volumes && viewItem =~ /^(volume|volenv)$/", "group": "inline@1" },
+        { "command": "cpt.deleteVolume",     "when": "view == cpt.volumes && viewItem =~ /^(volume|volenv)$/", "group": "1_run@1" },
+        { "command": "cpt.addEnvironment",   "when": "view == cpt.envs && viewItem == project", "group": "inline@1" },
+        { "command": "cpt.addEnvironment",   "when": "view == cpt.envs && viewItem == project", "group": "1_run@1" },
+        { "command": "cpt.toggleShared",     "when": "view == cpt.envs && viewItem == project", "group": "1_run@2" },
+        { "command": "cpt.removeProject",    "when": "view == cpt.envs && viewItem == project", "group": "2_edit@1" }
+      ]
+    }
+  }
+}

@@ -1,0 +1,9 @@
+.vscode/**
+.git/**
+.gitignore
+node_modules/**
+media/icon-source.svg
+media/icons-preview/**
+*.vsix
+verify-firewall.sh
+wsl-manager/**
