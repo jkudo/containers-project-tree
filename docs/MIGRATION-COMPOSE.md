@@ -219,14 +219,8 @@ Run all existing flows through compose, without yet exposing the new network opt
 9. Update `envVolumeRoles` for compose naming.
 10. Manual E2E: new project / env creation, Open, Stop, Rebuild, Delete — same UX as before.
 
-### Phase 2 — Migration tooling for existing envs
-1. Detect "old-format anchor" at activation time (devcontainer.json has a top-level `build` field).
-2. New command `cpt.migrateToCompose` (project right-click):
-   - Read existing env settings.
-   - Generate `<project>/.devcontainer/docker-compose.yml`.
-   - Rewrite each env's `devcontainer.json` to the compose-reference shape.
-   - Optionally remove the old image / container after confirm.
-3. No auto-migration — explicit user action only.
+### Phase 2 — (skipped)
+Decided 2026-05-29 to drop backwards compatibility entirely (single-user repo, no existing envs in `cpt.projects`). Compose-only from 0.2.0; the user clears any pre-existing envs before upgrading.
 
 ### Phase 3 — Network policy enabled
 1. Add `cpt.projects[].network` schema.
@@ -253,19 +247,9 @@ Run all existing flows through compose, without yet exposing the new network opt
 
 ## 5. Migration / compatibility
 
-### For users with existing envs
+**No backwards compatibility.** Single-user repo, clean break. Compose-only from 0.2.0.
 
-| User | Action |
-|---|---|
-| Brand-new user | Compose mode from day one. |
-| Existing-env user | Warning at activation ("old-format detected") → manual `cpt.migrateToCompose` command, or keep running old-format for a deprecation window. |
-
-**Backwards compatibility:** the initial release keeps the old code path as a fallback for old-format anchors. Removed in 0.3.0.
-
-### Why no automatic migration
-- The migration destroys existing image / volume / container artifacts; not reversible.
-- Workspace data is preserved, but the change still surprises users.
-- An explicit action provides better psychological safety.
+The user clears `cpt.projects` (and removes any leftover anchors / containers / volumes manually) before upgrading. No `build`-field detection, no fallback code paths, no migration tooling — keeps the implementation 30–40 % smaller.
 
 ---
 
