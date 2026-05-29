@@ -2,7 +2,7 @@
   "name": "containers-project-tree",
   "displayName": "Containers Project Tree",
   "description": "Manage fully isolated dev containers per project from a sidebar tree. Independent image and volume per container, optional in-container egress allowlist firewall, multi-template scaffolding (Debian / Alpine / RHEL). Works with WSL and Docker Desktop.",
-  "version": "0.1.0",
+  "version": "0.2.0-dev.9",
   "publisher": "jkudo",
   "icon": "media/icon.png",
   "homepage": "https://github.com/jkudo/containers-project-tree#readme",
@@ -84,6 +84,7 @@
       { "command": "cpt.firewallOff",      "title": "Firewall OFF",    "icon": "$(shield)" },
       { "command": "cpt.editDockerfile",   "title": "Edit Dockerfile", "icon": "$(file-code)" },
       { "command": "cpt.editFirewall",     "title": "Edit firewall script", "icon": "$(shield)" },
+      { "command": "cpt.editCompose",      "title": "Edit docker-compose.yml", "icon": "$(file-code)" },
       { "command": "cpt.resyncTemplate",   "title": "Re-apply template", "icon": "$(sync)" },
       { "command": "cpt.deleteVolume",     "title": "Delete volume", "icon": "$(trash)" },
       { "command": "cpt.removeEnvironment","title": "Delete container", "icon": "$(trash)" },
@@ -123,7 +124,8 @@
         { "command": "cpt.addEnvironment",   "when": "view == cpt.envs && viewItem == project", "group": "inline@1" },
         { "command": "cpt.addEnvironment",   "when": "view == cpt.envs && viewItem == project", "group": "1_run@1" },
         { "command": "cpt.toggleShared",     "when": "view == cpt.envs && viewItem == project", "group": "1_run@2" },
-        { "command": "cpt.removeProject",    "when": "view == cpt.envs && viewItem == project", "group": "2_edit@1" }
+        { "command": "cpt.editCompose",      "when": "view == cpt.envs && viewItem == project", "group": "2_config@1" },
+        { "command": "cpt.removeProject",    "when": "view == cpt.envs && viewItem == project", "group": "3_edit@1" }
       ]
     }
   }

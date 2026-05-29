@@ -36,36 +36,31 @@ function parsePs(out) {
 
 const getCfg = () => vscode.workspace.getConfiguration('cpt');
 const getProjects = () => getCfg().get('projects') || [];
-const volName = (s) => s.toLowerCase().replace(/[^a-z0-9_.-]/g, '-') + '-src';
+// Compose-managed volume name = `<composeProjectName>_<volname>`. We declare volumes as
+// `<env>-src` / `<env>-home` / `shared` in the YAML; compose prefixes them.
+const composeVolName = (projectName, name) => `${composeProjectName(projectName)}_${name}`;
 
-// env のコンテナと関連 volume（source / memory / 履歴）を削除
+// Remove this env's compose service + its image + its workspace/home volumes.
+// Shared volume (`<stack>_shared`) is intentionally left alone — other envs in the project may
+// still need it; removed only by removeProject.
 async function deleteEnvVolumes(projectName, env) {
-  const exe = env.engine === 'wsl' ? 'wsl.exe' : 'docker';
-  const prefix = env.engine === 'wsl' ? ['-d', env.distro, 'docker'] : [];
-  const nscEnv = env.envId || env.label;
-  const vols = new Set([volName(`${projectName}-${env.label}`), volName(projectName)]);
-  const id = ((await run(exe, [...prefix, 'ps', '-aq',
-    '--filter', `label=cpt.project=${projectName}`, '--filter', `label=cpt.env=${nscEnv}`])) || '')
-    .split(/\r?\n/)[0].trim();
-  let image = '';
-  if (id) {
-    const m = await run(exe, [...prefix, 'inspect', id, '--format', '{{range .Mounts}}{{if .Name}}{{.Name}} {{end}}{{end}}']);
-    if (m) for (const v of m.split(/\s+/)) if (v) vols.add(v);
-    image = ((await run(exe, [...prefix, 'inspect', id, '--format', '{{.Config.Image}}'])) || '').trim();
-    await run(exe, [...prefix, 'rm', '-f', id]);
+  if (!env) return;
+  // 1. Remove the service container + anonymous resources via compose.
+  await composeRun(projectName, env, 'rm', '-fsv', env.label);
+  // 2. Remove named volumes belonging to this env.
+  const { exe, prefix } = engineFor(env);
+  for (const suffix of ['src', 'home']) {
+    await run(exe, [...prefix, 'volume', 'rm', composeVolName(projectName, `${env.label}-${suffix}`)]);
   }
-  for (const v of vols) await run(exe, [...prefix, 'volume', 'rm', v]);
-  // このコンテナ専用イメージ（vsc-<env>-<hash> と -uid 版）を削除。共有レイヤーは他で使用中なら残る
-  if (image) {
-    await run(exe, [...prefix, 'rmi', '-f', image]);
-    const sibling = image.endsWith('-uid') ? image.slice(0, -4) : image + '-uid';
-    await run(exe, [...prefix, 'rmi', '-f', sibling]);
-  }
+  // 3. Remove the compose-built image (and its `-uid` sibling that Dev Containers creates).
+  const image = `${composeProjectName(projectName)}-${env.label}`;
+  await run(exe, [...prefix, 'rmi', '-f', image]);
+  await run(exe, [...prefix, 'rmi', '-f', `${image}-uid`]);
 }
 
-// env 専用 volume の {name -> role} を返す（共有 volume は含めない／呼び出し側で分離）。
-// 実在チェックはしない（呼び出し側でエンジンの volume 一覧と突き合わせる）。
-// コンテナがあれば mounts から hash 名（履歴/設定）も復元する。
+// {volumeName -> role} for one env. Used by the Volumes panel to attribute each env's
+// compose-managed volumes; container inspect refines the map if the service is running so
+// the actual mount destinations are reflected (catches any extra mounts the user added).
 async function envVolumeRoles(project, env) {
   const { exe, prefix } = engineFor(env);
   const nscEnv = env.envId || env.label;
@@ -75,15 +70,18 @@ async function envVolumeRoles(project, env) {
     '/shared': 'shared (/shared)'
   };
   const map = new Map();
-  map.set(volName(`${project}-${env.label}`), roleByDest['/workspace']);
+  // Seed with the compose-managed names so the Volumes panel can group them even when the
+  // service has never been started.
+  map.set(composeVolName(project, `${env.label}-src`), roleByDest['/workspace']);
+  map.set(composeVolName(project, `${env.label}-home`), roleByDest['/home/dev']);
   const id = ((await run(exe, [...prefix, 'ps', '-aq', '--filter', `label=cpt.project=${project}`, '--filter', `label=cpt.env=${nscEnv}`])) || '').split(/\r?\n/)[0].trim();
   if (id) {
     const m = await run(exe, [...prefix, 'inspect', id, '--format', '{{range .Mounts}}{{if .Name}}{{.Name}}={{.Destination}};{{end}}{{end}}']);
     if (m) for (const pair of m.split(';')) {
       const i = pair.indexOf('='); if (i <= 0) continue;
       const name = pair.slice(0, i);
-      // `vscode` is Dev Containers' shared VS Code Server cache (external=true, mounted
-      // into every dev container on this engine) — never attribute it to a specific env.
+      // `vscode` = Dev Containers' shared VS Code Server cache (external=true). Never attribute
+      // it to a specific env.
       if (name === 'vscode') continue;
       map.set(name, roleByDest[pair.slice(i + 1)] || pair.slice(i + 1) || '(volume)');
     }
@@ -292,7 +290,7 @@ class VolumeProvider {
       projNode.children = [];
       let envCount = 0;
       if (g && g.reachable) {
-        const sharedName = sharedVolName(p.name);
+        const sharedName = composeVolName(p.name, 'shared');
         // each env collapsed into one node (its volumes are a set; useless to keep individually)
         for (const e of resolveEnvs(p)) {
           const roles = await envVolumeRoles(p.name, e);
@@ -350,11 +348,35 @@ class VolumeProvider {
 }
 
 // ---- scaffolding ----
-const sharedVolName = (name) => name.toLowerCase().replace(/[^a-z0-9_.-]/g, '-') + '-shared';
+// Compose project name = "cpt-<project>" (sanitised). Used as compose `name:` so that the
+// engine-wide identifiers (container_name, network name, built image, named volumes) all
+// inherit a `cpt-` prefix and don't collide with non-extension docker resources.
+const composeProjectName = (projectName) => 'cpt-' + projectName.toLowerCase().replace(/[^a-z0-9_.-]/g, '-');
 
 function envDevDir(env) {
   if (env.engine === 'wsl') return `\\\\wsl.localhost\\${env.distro}${String(env.path).replace(/\//g, '\\')}\\.devcontainer`;
   return path.join(String(env.path), '.devcontainer');
+}
+
+// Project root = the parent of env.path (e.g. /home/dev/projects/<project> for an env at
+// /home/dev/projects/<project>/<envLabel>). Project-level compose YAML and shared scaffolding
+// live under <projectRoot>/.devcontainer/.
+function projectRootFromEnv(env) {
+  const p = String(env.path).replace(/\/+$/, '');
+  const i = p.lastIndexOf('/');
+  return i > 0 ? p.slice(0, i) : p;
+}
+function projectDevDir(env) {
+  const root = projectRootFromEnv(env);
+  if (env.engine === 'wsl') return `\\\\wsl.localhost\\${env.distro}${root.replace(/\//g, '\\')}\\.devcontainer`;
+  return path.join(String(root), '.devcontainer');
+}
+function projectComposeFilePath(env) { return path.join(projectDevDir(env), 'docker-compose.yml'); }
+// Compose `-f` needs the path as seen from the engine's docker daemon perspective.
+// For WSL, that's the Linux path inside the distro; for local, a host filesystem path.
+function projectComposeFileForEngine(env) {
+  if (env.engine === 'wsl') return `${projectRootFromEnv(env)}/.devcontainer/docker-compose.yml`;
+  return projectComposeFilePath(env);
 }
 
 // Bake the chosen base image directly into the Dockerfile's FROM line, dropping the
@@ -366,23 +388,24 @@ function applyBaseImageToDockerfile(content, baseImage) {
     .replace(/^ARG BASE_IMAGE=.*\r?\n/m, '')
     .replace(/^FROM .+$/m, `FROM ${base}`);
 }
-function devcontainerJson(project, env, volume, shared, firewall) {
-  const mounts = [
-    'source=home-${devcontainerId},target=/home/dev,type=volume'
-  ];
-  if (shared) mounts.push(`source=${sharedVolName(project)},target=/shared,type=volume`);
-  const buildArgs = { TZ: '${localEnv:TZ:Asia/Tokyo}', GIT_DELTA_VERSION: '0.18.2' };
+// devcontainer.json (per-env, compose-reference shape).
+// All container/network/volume specs live in the project-level docker-compose.yml; here we only
+// point at it and tell Dev Containers which service to attach to.
+function devcontainerJson(project, env, firewall) {
   const o = {
     name: `${project} / ${env}`,
-    build: { dockerfile: 'Dockerfile', args: buildArgs },
-    runArgs: ['--cap-add=NET_ADMIN', '--cap-add=NET_RAW', '--label', `cpt.project=${project}`, '--label', `cpt.env=${env}`],
+    dockerComposeFile: ['../../.devcontainer/docker-compose.yml'],
+    service: env,
+    // Without `runServices`, Dev Containers brings up ALL services in the compose stack.
+    // Pin it to just this env so opening one container doesn't drag its siblings along.
+    runServices: [env],
+    workspaceFolder: '/workspace',
+    remoteUser: 'dev',
+    // stopContainer leaves sibling envs running when this VS Code window closes.
+    shutdownAction: 'stopContainer',
     customizations: { vscode: {
       extensions: ['anthropic.claude-code', 'dbaeumer.vscode-eslint', 'esbenp.prettier-vscode', 'eamodio.gitlens'],
       settings: {
-        // Terminal default shell is left to the container — set via the user's login shell
-        // (the bundled "default" template uses bash; "sample" runs `chsh -s /bin/zsh node`).
-        // Copilot: このリポの .github/copilot-instructions.md のみ使用し、
-        // ユーザー/グローバルの設定ベース命令や親リポ参照は無視（ワークスペース設定で上書き）
         'github.copilot.chat.codeGeneration.useInstructionFiles': true,
         'chat.useCustomizationsInParentRepositories': false,
         'github.copilot.chat.codeGeneration.instructions': [],
@@ -392,17 +415,98 @@ function devcontainerJson(project, env, volume, shared, firewall) {
         'github.copilot.chat.pullRequestDescriptionGeneration.instructions': []
       }
     } },
-    remoteUser: 'dev',
-    mounts,
-    containerEnv: {},
-    workspaceMount: `source=${volume},target=/workspace,type=volume`,
-    workspaceFolder: '/workspace'
+    containerEnv: {}
   };
-  // firewall は既定 OFF。ON のときだけ init-firewall を postStartCommand で実行する。
-  // （NET_ADMIN/NET_RAW と init-firewall.sh は常に同梱されるので、後から右クリックで ON 可能）
   if (firewall) { o.postStartCommand = 'sudo /usr/local/bin/init-firewall.sh'; o.waitFor = 'postStartCommand'; }
   return JSON.stringify(o, null, 2) + '\n';
 }
+
+// Generate the project-level docker-compose.yml. The source of truth is `cpt.projects` in
+// settings — this regenerates the whole file every time (no in-place YAML mutation).
+function composeYaml(project) {
+  const envs = resolveEnvs(project);
+  const composeName = composeProjectName(project.name);          // `cpt-<project>` — drives compose namespace (image / volume / -p arg / container_name / network)
+  const containerPrefix = composeName;
+  const networkName = `${composeName}-net`;
+  const shared = !!project.shared;
+  const L = [];
+  const push = (s) => L.push(s);
+  push(`name: ${composeName}`);
+  push('');
+  push('services:');
+  if (!envs.length) push('  # (no containers yet — add one via the tree to populate this stack)');
+  for (const e of envs) {
+    const lbl = e.label;
+    push(`  ${lbl}:`);
+    push(`    build:`);
+    push(`      context: ../${lbl}/.devcontainer`);
+    push(`      dockerfile: Dockerfile`);
+    push(`    container_name: ${containerPrefix}-${lbl}`);
+    push(`    hostname: ${lbl}`);
+    push(`    cap_add:`);
+    push(`      - NET_ADMIN`);
+    push(`      - NET_RAW`);
+    push(`    labels:`);
+    push(`      cpt.project: "${project.name}"`);
+    push(`      cpt.env: "${lbl}"`);
+    push(`    networks:`);
+    push(`      net:`);
+    push(`        aliases:`);
+    push(`          - ${lbl}`);
+    push(`    volumes:`);
+    push(`      - ${lbl}-src:/workspace`);
+    push(`      - ${lbl}-home:/home/dev`);
+    // Note: Dev Containers extension auto-mounts the engine-wide `vscode` volume at /vscode
+    // for compose-mode dev containers (independent of this YAML). We intentionally don't
+    // declare a /vscode mount here — declaring one would be silently overridden by Dev
+    // Containers, while we still want its server-cache sharing semantics anyway.
+    if (shared) push(`      - shared:/shared`);
+    push(`    extra_hosts:`);
+    push(`      - "host.docker.internal:host-gateway"`);
+    push(`    command: sleep infinity`);
+  }
+  push('');
+  push('networks:');
+  push(`  net:`);
+  push(`    name: ${networkName}`);
+  push(`    driver: bridge`);
+  push('');
+  push('volumes:');
+  if (!envs.length) push('  {}');
+  for (const e of envs) {
+    push(`  ${e.label}-src:`);
+    push(`  ${e.label}-home:`);
+  }
+  if (shared) push(`  shared:`);
+  return L.join('\n') + '\n';
+}
+
+// Write the project-level compose YAML at <projectRoot>/.devcontainer/docker-compose.yml.
+// Pulls project state from settings (single source of truth).
+// Re-render <projectRoot>/.devcontainer/docker-compose.yml from a fresh project config.
+// `sampleEnv` is any env of the project (needed to derive engine/distro + paths).
+function writeProjectAnchorFor(proj, sampleEnv) {
+  if (!sampleEnv) return;
+  const dir = projectDevDir(sampleEnv);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'docker-compose.yml'), composeYaml(proj), 'utf8');
+}
+
+// Look up the project entry in settings that owns a given env (used so command handlers can
+// regenerate the compose file from the latest settings after they save).
+function findProjectByName(name) {
+  return getProjects().find(p => p.name === name);
+}
+
+// Wrapper that runs `docker compose -p <name> -f <file> …` against the engine of the given env.
+async function composeRun(projectName, env, ...args) {
+  if (!env) return null;
+  const { exe, prefix } = engineFor(env);
+  const composeFile = projectComposeFileForEngine(env);
+  return await run(exe, [...prefix, 'compose', '-p', composeProjectName(projectName), '-f', composeFile, ...args]);
+}
+// Same, when only the project name + a representative env are available (post-removal cases).
+async function composeRunOnEngine(projectName, sampleEnv, ...args) { return composeRun(projectName, sampleEnv, ...args); }
 // User-editable templates live at <globalStorage>/templates/<tplName>/{Dockerfile,init-firewall.sh}
 // Bundled templates (default + sample) live in <ext>/media/<dir> and auto-sync to the user copy
 // on every activate; users can create additional templates via "New template…" which are
@@ -465,12 +569,15 @@ function readTemplate(tplName, fileName) {
   for (const p of candidates) if (p && fs.existsSync(p)) return fs.readFileSync(p, 'utf8');
   return fs.readFileSync(bundledTemplateFile(DEFAULT_TPL, fileName), 'utf8');
 }
-function writeAnchor(devDir, project, env, volume, shared, firewall, tplName, baseImage) {
+// Writes the per-env files (Dockerfile + init-firewall.sh + devcontainer.json) under the env's
+// own `.devcontainer/`. The project-level docker-compose.yml is written separately by
+// `writeProjectAnchorFor(project, sampleEnv)` after the caller saves settings.
+function writeAnchor(devDir, project, env, firewall, tplName, baseImage) {
   fs.mkdirSync(devDir, { recursive: true });
   const dockerfile = applyBaseImageToDockerfile(readTemplate(tplName, 'Dockerfile'), baseImage);
   fs.writeFileSync(path.join(devDir, 'Dockerfile'), dockerfile, { encoding: 'utf8' });
   fs.writeFileSync(path.join(devDir, 'init-firewall.sh'), readTemplate(tplName, 'init-firewall.sh').replace(/\r\n/g, '\n'), { encoding: 'utf8' });
-  fs.writeFileSync(path.join(devDir, 'devcontainer.json'), devcontainerJson(project, env, volume, shared, firewall), { encoding: 'utf8' });
+  fs.writeFileSync(path.join(devDir, 'devcontainer.json'), devcontainerJson(project, env, firewall), { encoding: 'utf8' });
 }
 // 既存 env の devcontainer.json で firewall(postStartCommand) を ON/OFF
 function setFirewall(env, enable) {
@@ -479,18 +586,6 @@ function setFirewall(env, enable) {
   try { obj = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return false; }
   if (enable) { obj.postStartCommand = 'sudo /usr/local/bin/init-firewall.sh'; obj.waitFor = 'postStartCommand'; }
   else { delete obj.postStartCommand; delete obj.waitFor; }
-  fs.writeFileSync(file, JSON.stringify(obj, null, 2) + '\n', 'utf8');
-  return true;
-}
-// 既存 env の devcontainer.json に shared マウントを追加/削除（workspaceMount 等は保持）
-function setSharedMount(projectName, env, enable) {
-  const file = path.join(envDevDir(env), 'devcontainer.json');
-  let obj;
-  try { obj = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { return false; }
-  const src = `source=${sharedVolName(projectName)},`;
-  const mounts = (Array.isArray(obj.mounts) ? obj.mounts : []).filter(m => !String(m).startsWith(src));
-  if (enable) mounts.push(`source=${sharedVolName(projectName)},target=/shared,type=volume`);
-  obj.mounts = mounts;
   fs.writeFileSync(file, JSON.stringify(obj, null, 2) + '\n', 'utf8');
   return true;
 }
@@ -567,7 +662,6 @@ async function promptEnvironment(projectName, existingLabels, shared, engine, di
   });
   if (baseInput === undefined) return null;
   const baseImage = baseInput.trim();
-  const volume = volName(`${projectName}-${label}`);
   // New envs default firewall=off; the chosen template is recorded so Re-apply uses the same one.
   const env = { label, engine, firewall: 'off', template: tplName };
   if (baseImage && baseImage !== 'node:20') env.baseImage = baseImage;  // only store non-default
@@ -581,7 +675,7 @@ async function promptEnvironment(projectName, existingLabels, shared, engine, di
     devDir = path.join(os.homedir(), 'projects', projectName, label, '.devcontainer');
   }
   env.path = openPath;
-  try { writeAnchor(devDir, projectName, label, volume, shared, false, tplName, env.baseImage); }  // scaffold with firewall=off + chosen template + base image
+  try { writeAnchor(devDir, projectName, label, false, tplName, env.baseImage); }  // scaffold per-env files (firewall=off by default)
   catch (e) { vscode.window.showErrorMessage('Failed to create container: ' + e.message); return null; }
   return env;
 }
@@ -811,20 +905,19 @@ function activate(context) {
       if (idx < 0) return;
       const proj = projects[idx];
       const enable = !proj.shared;
-      const envs = envsOf(proj);
-      for (const e of envs) setSharedMount(item.projectName, e, enable);
-      if (enable) {
-        const seen = new Set();
-        for (const e of envs) {
-          const key = e.engine === 'wsl' ? `wsl:${e.distro}` : 'win';
-          if (seen.has(key)) continue; seen.add(key);
-          const exe = e.engine === 'wsl' ? 'wsl.exe' : 'docker';
-          const prefix = e.engine === 'wsl' ? ['-d', e.distro, 'docker'] : [];
-          await run(exe, [...prefix, 'run', '--rm', '-v', `${sharedVolName(item.projectName)}:/s`, 'alpine', 'chown', '-R', '1000:1000', '/s']);
-        }
-      }
-      const next = projects.slice(); next[idx] = { ...proj, environments: envs, shared: enable };
+      const envs = resolveEnvs(proj);
+      const next = projects.slice(); next[idx] = { ...proj, environments: envsOf(proj), shared: enable };
       await saveProjects(next);
+      // Regenerate the compose YAML so each service either has the `shared:/shared` mount or not.
+      try { writeProjectAnchorFor(next[idx], envs[0]); } catch (e) { vscode.window.showWarningMessage('Settings updated but failed to regen docker-compose.yml: ' + e.message); }
+      if (enable && envs[0]) {
+        // Pre-create the shared volume and chown it to uid 1000 (the `dev` user) so the first
+        // container that mounts it can write. Volume is named `<stack>_shared` by compose.
+        const { exe, prefix } = engineFor(envs[0]);
+        const vol = composeVolName(item.projectName, 'shared');
+        await run(exe, [...prefix, 'volume', 'create', vol]);
+        await run(exe, [...prefix, 'run', '--rm', '-v', `${vol}:/s`, 'alpine', 'chown', '-R', '1000:1000', '/s']);
+      }
       provider.refresh();
       vscode.window.showInformationMessage(`Shared volume of "${item.projectName}" ${enable ? 'enabled (mounted at /shared in every container)' : 'disabled'}. Rebuild each container to apply.`);
     }),
@@ -848,30 +941,32 @@ function activate(context) {
       const next = projects.slice();
       next[idx] = { ...proj, engine, environments: envs };
       if (engine === 'wsl') next[idx].distro = distro;
-      await saveProjects(next); provider.refresh();
+      await saveProjects(next);
+      // Re-render the project-level compose YAML now that the new env exists.
+      try { writeProjectAnchorFor(next[idx], env); } catch (e) { vscode.window.showWarningMessage('Container created but failed to update docker-compose.yml: ' + e.message); }
+      provider.refresh();
     }),
     vscode.commands.registerCommand('cpt.open', async (item) => {
       if (item && item.openUri) await openProject(item.openUri);
     }),
     vscode.commands.registerCommand('cpt.stop', async (item) => {
-      if (!item || !item.containerId) { vscode.window.showInformationMessage('Nothing to stop'); return; }
-      await run(item.engine.exe, [...item.engine.prefix, 'stop', item.containerId]);
+      if (!item || !item.envObj) { vscode.window.showInformationMessage('Nothing to stop'); return; }
+      // Use compose stop so it integrates with the stack lifecycle (no-op if already stopped).
+      await composeRun(item.projectName, item.envObj, 'stop', item.envLabel);
       provider.refresh();
     }),
     vscode.commands.registerCommand('cpt.rebuild', async (item) => {
-      if (!item || !item.openUri) return;
-      // コンテナと“そのイメージ”を削除してから開き直す（devcontainer.json 変更を確実に反映）。
-      // イメージの devcontainer.metadata ラベルに postStartCommand 等が焼き込まれるため、
-      // イメージを残すと firewall OFF 等が効かず postStartCommand が再実行される。
-      if (item.containerId) {
-        const image = ((await run(item.engine.exe, [...item.engine.prefix, 'inspect', item.containerId, '--format', '{{.Config.Image}}'])) || '').trim();
-        await run(item.engine.exe, [...item.engine.prefix, 'rm', '-f', item.containerId]);
-        if (image) {
-          await run(item.engine.exe, [...item.engine.prefix, 'rmi', '-f', image]);
-          const sib = image.endsWith('-uid') ? image.slice(0, -4) : image + '-uid';
-          await run(item.engine.exe, [...item.engine.prefix, 'rmi', '-f', sib]);
-        }
-      }
+      if (!item || !item.envObj) return;
+      const proj = findProjectByName(item.projectName);
+      try { if (proj) writeProjectAnchorFor(proj, item.envObj); } catch (_) { /* fall through; build will surface YAML errors */ }
+      // 1. tear this service down (container + anonymous resources)
+      await composeRun(item.projectName, item.envObj, 'rm', '-fsv', item.envLabel);
+      // 2. drop its image so the Dockerfile is fully re-read (compose names its built images
+      //    as `<projectName>-<serviceName>`; the `-uid` sibling is added by Dev Containers later)
+      const composeImage = `${composeProjectName(item.projectName)}-${item.envLabel}`;
+      await run(item.engine.exe, [...item.engine.prefix, 'rmi', '-f', composeImage]);
+      await run(item.engine.exe, [...item.engine.prefix, 'rmi', '-f', `${composeImage}-uid`]);
+      // 3. let openProject hand off to Dev Containers, which will run `compose up` itself.
       await openProject(item.openUri);
     }),
     vscode.commands.registerCommand('cpt.firewallOn',  (item) => setFirewallState(item, true)),
@@ -889,6 +984,23 @@ function activate(context) {
       if (!fs.existsSync(file)) { vscode.window.showErrorMessage(`Not found: ${file}`); return; }
       try { await vscode.window.showTextDocument(vscode.Uri.file(file)); }
       catch (e) { vscode.window.showErrorMessage('Failed to open init-firewall.sh: ' + e.message); }
+    }),
+    vscode.commands.registerCommand('cpt.editCompose', async (item) => {
+      // Project right-click handler — opens <projectRoot>/.devcontainer/docker-compose.yml.
+      // The YAML is the source of truth for ports/extra mounts/env vars/etc. that can't be
+      // expressed via the per-env Dockerfile alone.
+      if (!item || !item.projectName) return;
+      const proj = findProjectByName(item.projectName);
+      const sample = proj ? resolveEnvs(proj)[0] : null;
+      if (!proj || !sample) { vscode.window.showInformationMessage(`Project "${item.projectName}" has no containers yet — add one to generate docker-compose.yml.`); return; }
+      const file = projectComposeFilePath(sample);
+      if (!fs.existsSync(file)) {
+        // Defensive regen if the YAML went missing (e.g. manual rm).
+        try { writeProjectAnchorFor(proj, sample); } catch (_) { /* fall through */ }
+      }
+      if (!fs.existsSync(file)) { vscode.window.showErrorMessage(`Not found: ${file}`); return; }
+      try { await vscode.window.showTextDocument(vscode.Uri.file(file)); }
+      catch (e) { vscode.window.showErrorMessage('Failed to open docker-compose.yml: ' + e.message); }
     }),
     vscode.commands.registerCommand('cpt.resyncTemplate', async (item) => {
       if (!item || !item.envObj) return;
@@ -909,13 +1021,11 @@ function activate(context) {
         fs.mkdirSync(devDir, { recursive: true });
         for (const p of picks) {
           if (p.regen) {
-            const proj = getProjects().find(pr => pr.name === item.projectName) || {};
             const envCfg = item.envObj || {};
             const lbl = envCfg.label || item.envLabel;
-            const vol = volName(`${item.projectName}-${lbl}`);
             const fwOn = envCfg.firewall !== 'off';
             fs.writeFileSync(path.join(devDir, 'devcontainer.json'),
-              devcontainerJson(item.projectName, lbl, vol, !!proj.shared, fwOn), 'utf8');
+              devcontainerJson(item.projectName, lbl, fwOn), 'utf8');
             continue;
           }
           let content = readTemplate(tplName, p.f);
@@ -923,6 +1033,11 @@ function activate(context) {
           if (p.f === 'init-firewall.sh') content = content.replace(/\r\n/g, '\n');
           fs.writeFileSync(path.join(devDir, p.f), content, 'utf8');
         }
+        // Also re-render the project-level docker-compose.yml so shared/firewall state of all envs is in sync.
+        try {
+          const proj = findProjectByName(item.projectName);
+          if (proj) writeProjectAnchorFor(proj, item.envObj);
+        } catch (_) { /* non-fatal */ }
         const names = picks.map(p => p.f).join(' + ');
         vscode.window.showInformationMessage(`Re-applied ${names} for "${item.envLabel}" (template "${tplName}"). Rebuild to apply.`);
       } catch (e) { vscode.window.showErrorMessage('Failed to re-apply template: ' + e.message); }
@@ -967,12 +1082,31 @@ function activate(context) {
           if (choice === 'Delete volumes & images' && e) {
             progress.report({ message: 'removing container, image and volumes' });
             await deleteEnvVolumes(item.projectName, e);
+          } else if (e) {
+            // Keep volumes — just stop and remove the container itself via compose.
+            progress.report({ message: 'removing container (volumes kept)' });
+            await composeRun(item.projectName, e, 'rm', '-fs', e.label);
           } else {
             progress.report({ message: 'removing settings entry' });
           }
           const next = projects.slice();
           next[idx] = { ...projects[idx], environments: envs.filter(x => x.label !== item.envLabel) };
           await saveProjects(next);
+          // Remove the env's anchor folder (Dockerfile / init-firewall.sh / devcontainer.json).
+          // The folder is only used by this extension — no user code lives there.
+          if (e && e.path) {
+            progress.report({ message: 'removing anchor files' });
+            const envRoot = e.engine === 'wsl'
+              ? `\\\\wsl.localhost\\${e.distro}${String(e.path).replace(/\//g, '\\')}`
+              : String(e.path);
+            try { fs.rmSync(envRoot, { recursive: true, force: true }); } catch (_) { /* non-fatal */ }
+          }
+          // Regenerate the compose YAML so the removed service is dropped.
+          try {
+            const remaining = resolveEnvs(next[idx]);
+            if (remaining.length) writeProjectAnchorFor(next[idx], remaining[0]);
+            // If 0 envs remain, leave the empty compose YAML; project removal will clean up.
+          } catch (_) { /* non-fatal */ }
         }
       );
       provider.refresh(); volProvider.refresh();
@@ -988,25 +1122,41 @@ function activate(context) {
       await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: `Deleting project "${item.projectName}"…`, cancellable: false },
         async (progress) => {
-          if (idx >= 0 && choice === 'Delete volumes & images') {
+          let projectAnchorRoot = null;
+          if (idx >= 0) {
             const envs = envsOf(projects[idx]);
-            for (let i = 0; i < envs.length; i++) {
-              progress.report({ message: `container ${envs[i].label} (${i + 1}/${envs.length})`, increment: (1 / (envs.length + 1)) * 100 });
-              await deleteEnvVolumes(item.projectName, envs[i]);
+            const sample = resolveEnvs(projects[idx])[0];
+            if (sample) {
+              const root = projectRootFromEnv(sample);
+              projectAnchorRoot = sample.engine === 'wsl'
+                ? `\\\\wsl.localhost\\${sample.distro}${root.replace(/\//g, '\\')}`
+                : root;
             }
-            progress.report({ message: 'shared volumes', increment: (1 / (envs.length + 1)) * 100 });
-            const seen = new Set();
-            for (const e of envs) {
-              const key = e.engine === 'wsl' ? `wsl:${e.distro}` : 'win';
-              if (seen.has(key)) continue; seen.add(key);
-              const exe = e.engine === 'wsl' ? 'wsl.exe' : 'docker';
-              const prefix = e.engine === 'wsl' ? ['-d', e.distro, 'docker'] : [];
-              await run(exe, [...prefix, 'volume', 'rm', sharedVolName(item.projectName)]);
+            if (choice === 'Delete volumes & images' && sample) {
+              progress.report({ message: 'compose down -v' });
+              // Tear down the whole stack (containers, network and named volumes including shared).
+              await composeRun(item.projectName, sample, 'down', '-v');
+              // Also drop the compose-built images for each env (with their -uid siblings).
+              const { exe, prefix } = engineFor(sample);
+              const composeName = composeProjectName(item.projectName);
+              for (let i = 0; i < envs.length; i++) {
+                progress.report({ message: `image ${envs[i].label} (${i + 1}/${envs.length})`, increment: (1 / (envs.length + 1)) * 100 });
+                await run(exe, [...prefix, 'rmi', '-f', `${composeName}-${envs[i].label}`]);
+                await run(exe, [...prefix, 'rmi', '-f', `${composeName}-${envs[i].label}-uid`]);
+              }
+            } else if (sample) {
+              progress.report({ message: 'compose down (volumes kept)' });
+              await composeRun(item.projectName, sample, 'down');
+            } else {
+              progress.report({ message: 'removing settings entry' });
             }
-          } else {
-            progress.report({ message: 'removing settings entry' });
           }
           await saveProjects(getProjects().filter(p => p.name !== item.projectName));
+          // Remove the project anchor folder (compose YAML + every env's .devcontainer).
+          if (projectAnchorRoot) {
+            progress.report({ message: 'removing anchor files' });
+            try { fs.rmSync(projectAnchorRoot, { recursive: true, force: true }); } catch (_) { /* non-fatal */ }
+          }
         }
       );
       provider.refresh(); volProvider.refresh();

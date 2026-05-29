@@ -282,3 +282,112 @@ The user clears `cpt.projects` (and removes any leftover anchors / containers / 
 ## 8. Decision log
 
 - 2026-05-29: branch `feature/compose-migration` created at commit `46d337d`. Plan committed as the first step of Phase 0.
+- 2026-05-29: Phase 1 implementation landed (`composeYaml()`, `devcontainerJson` reshape, lifecycle commands switched to `docker compose …`, env-name DNS via compose service aliases). Several rounds of debugging during user E2E:
+  - `/vscode` mount in compose mode is owned by Dev Containers (auto-mounts the engine-wide `vscode` volume on top of any user declaration). Dropped the `vscode-server:/vscode` mount from the YAML.
+  - Dev Containers `runServices` defaults to all services. Pinned explicitly to `[<env>]` in devcontainer.json so opening one env doesn't drag siblings along.
+  - Container / network names: tried dropping `cpt-` prefix for readability, reverted to `cpt-…` for safety against multi-project name collisions on a shared engine.
+  - Added `cpt.editCompose` (project right-click → opens the project compose YAML).
+  - `removeEnvironment` / `removeProject` now also delete the anchor folders.
+
+## Phase 3 design — hybrid template flow (planned, not yet implemented)
+
+Project creation gains a **template source picker** that runs before per-env scaffolding:
+
+```
+Project creation:
+  1. Name
+  2. Engine (wsl / local)
+  3. Template source:
+       a. local    (bundled default / alpine / rhel + user-created)
+       b. official (Dev Containers registry, via devcontainer-cli)
+       c. none     (empty project, add envs later)
+  4a. local    → existing picker (default / alpine / rhel / …)
+  4b. official → spawn `devcontainer templates list --output-format json` → QuickPick
+                 the picked id is then applied via `devcontainer templates apply
+                 --template-id <id> --workspace-folder <projectRoot>`
+                 the resulting tree is classified (single vs multi-container)
+  5. Settings persist the source + template id alongside the new project entry.
+```
+
+### Settings shape (proposed)
+
+```jsonc
+{
+  "cpt.projects": [
+    {
+      "name": "myapp",
+      "engine": "wsl",
+      "composeMode": "managed",       // we own the project compose YAML (default)
+      "templateSource": "local",      // "local" | "official" | "none"
+      "templateId": "default",        // bundled / user template name, or official id
+      "environments": [ … ]
+    },
+    {
+      "name": "pyapp",
+      "engine": "wsl",
+      "composeMode": "template-owned", // the template ships its own compose; we don't regenerate
+      "templateSource": "official",
+      "templateId": "python-postgres",
+      "environments": [ { "label": "app", … } ]
+    }
+  ]
+}
+```
+
+### Behavioural split by `composeMode`
+
+| Action | `managed` | `template-owned` |
+|---|---|---|
+| Generate project compose YAML | every change | never (template owns it) |
+| Add container | works as today | disabled (template defines the services) |
+| Delete container | works as today | only via Delete project |
+| Open / Stop / Rebuild | per env | per env |
+| Edit Dockerfile / firewall | per env | per env (template's Dockerfile) |
+| Edit compose YAML | edit but Re-apply overwrites | edit is the primary mechanism |
+| Re-apply template | per env (Dockerfile / firewall / devcontainer.json) | project-level re-fetch via `templates apply` |
+
+### Official template integration via Dev Containers CLI
+
+Why CLI (not direct OCI, not `executeCommand`):
+
+- The `ms-vscode-remote.remote-containers` extension is already required (`extensionDependencies`). Its bundled CLI (`dist/dev-containers-cli-<ver>/dist/spec-node/devContainersSpecCLI.js`) is always available.
+- `executeCommand('remote-containers.addDevContainerConfigurationFiles', …)` hands off the picker to Dev Containers' own UI — we can't filter, annotate, mix our own templates, mark multi-container variants, or run post-processing in the same flow.
+- Direct OCI registry implementation would re-implement what the CLI already does (manifest pulls, blob extraction, cache). Hundreds of lines for zero extra capability.
+- The CLI path is wrapped behind a `TemplateProvider` interface so a future direct-OCI implementation can be swapped in without touching call sites.
+
+`findDevContainersCli()` glob-detects the latest installed CLI under `~/.vscode/extensions/ms-vscode-remote.remote-containers-*/dist/dev-containers-cli-*/dist/spec-node/devContainersSpecCLI.js`.
+
+### Single-container template → compose mode conversion
+
+Single-container templates write `.devcontainer/{Dockerfile,devcontainer.json}` in build mode. We convert by:
+
+1. Move the template's `Dockerfile` into `<env>/.devcontainer/Dockerfile`.
+2. Read the template's `devcontainer.json` and extract `features`, `customizations.{extensions,settings}`, `containerEnv`, `remoteEnv`, `forwardPorts`, `postCreateCommand` (anything not lifecycle-managed by us).
+3. Write our own `devcontainer.json` in compose-reference shape, **merged** with the preserved fields above (our copilot-isolation settings and `anthropic.claude-code` extension stay in the union).
+4. Copy `init-firewall.sh` from our bundled template (templates don't ship it).
+5. Generate the project compose YAML with `build.context: ../<env>/.devcontainer` pointing at the moved Dockerfile (or use `image:` directly if the template was image-only).
+
+After conversion the env is indistinguishable from one created via the local picker — `composeMode` stays `managed` and the user can add more envs (from any source) into the same project compose.
+
+### Multi-container template — template-owned mode
+
+If the applied template wrote its own `docker-compose.yml` (≥ 2 services), we **don't transform**. We:
+
+1. Set `composeMode: "template-owned"` and record `templateId`.
+2. Detect the primary service (`devcontainer.json.service`) and register it as the project's single env.
+3. Skip our project-level YAML regeneration entirely for this project.
+4. Disable `Add container` (the template defines what services exist).
+5. `Delete project` runs `docker compose down -v` against the template-supplied YAML, then removes the anchor folder.
+
+### Implementation phases inside Phase 3
+
+| Phase | Item | Size |
+|---|---|---|
+| 3.1 | Settings schema additions (`composeMode`, `templateSource`, `templateId`), back-compat read for projects that omit these fields | XS |
+| 3.2 | `TemplateProvider` abstraction + `LocalTemplateProvider` (wraps existing `listTemplates()`) | S |
+| 3.3 | `findDevContainersCli()` + `OfficialTemplateProvider` (templates list / apply via CLI) | S |
+| 3.4 | Project-create flow: source picker → per-source template picker | S |
+| 3.5 | Apply pipeline: single-template → compose conversion (Dockerfile + devcontainer.json merge) | M |
+| 3.6 | Apply pipeline: multi-template → template-owned project | S |
+| 3.7 | `composeMode` branching across existing handlers (addEnv, removeEnv, resync, YAML regen) | M |
+| 3.8 | E2E across the three creation paths (local, official-single, official-multi) | M |
