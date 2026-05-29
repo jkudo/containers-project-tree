@@ -2,7 +2,7 @@
   "name": "containers-project-tree",
   "displayName": "Containers Project Tree",
   "description": "Manage fully isolated dev containers per project from a sidebar tree. Independent image and volume per container, optional in-container egress allowlist firewall, multi-template scaffolding (Debian / Alpine / RHEL). Works with WSL and Docker Desktop.",
-  "version": "0.0.109",
+  "version": "0.1.0",
   "publisher": "jkudo",
   "icon": "media/icon.png",
   "homepage": "https://github.com/jkudo/containers-project-tree#readme",
